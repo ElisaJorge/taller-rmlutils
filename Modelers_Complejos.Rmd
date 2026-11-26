@@ -1,0 +1,374 @@
+---
+title: "Modelers complejos"
+author: "Jordi Verdú Naranjo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    number_sections: true
+    theme: united
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(RMLutils)
+library(data.table)
+dir.create(file.path("./trained_modelers"), showWarnings = FALSE)
+```
+
+## Los modelers complejos
+
+A parte de los modelers simples, ya sean implementados desde cero en RMLutils o los que hacen uso de librerías externas, existen algunos modelers que para instanciarse requieren de otro modeler:
+
+* classifRegRegressorModeler (variables semicontinuas)
+* benchRegressorModeler (modelos multivariantes con restricciones lineales)
+* preproRegressorModeler/preproClassifierModeler (preprocesado unido a modelers)
+* prePredRegressorModeler (modelo de predicción en cadena)
+* memoryRegressorModeler (modelo con capacidad de almacenar conjuntos de datos previos)
+
+En este tutorial veremos sobre todo los tres primeros, por ser los de aplicación más directa.
+
+## classifRegRegressorModeler
+
+Este objeto es uno de los modeler complejos de RMLutils. Se aplica a problemas de regresión con variables objetivo semicontinuas, en los que haya un número (o varios) repetidos una gran cantidad de veces en el conjunto de datos, haciéndolas inapropiadas para una regresión directa.
+
+Primero, se efectúa una clasificación para determinar si la predicción es uno de los números repetidos o no. 
+En caso afirmativo, simplemente se le asigna el número resultado de la clasificación, pero en caso contrario, se pasa a la regresión para determinar el valor de la variable objetivo.
+
+Podemos ver los parámetros que necesita para instanciarse buscando `classifRegRegressorModeler` en la ayuda.
+
+```{r}
+#Generamos datos apropiados para el modeler en dos pasos
+set.seed(273)
+data.dt <- generateRegressionData(n_samples = 1000,
+                                  generate_random_weights = FALSE)
+
+#Convertimos una cantidad razonable de registros a cero
+data.dt[regression_target < 0, regression_target := 0]
+print(table(data.dt[, regression_target == 0]))#Vemos cuántos datos son 0 exactamente
+#Aplicaremos un classifRegModeler para predecir primero si el resultado es distinto de 0 o no,
+#tras eso, se aplicará la regresión sobre los datos restantes.
+#Todo este proceso se gestiona internamente por el classifRegModeler
+
+#Definimos particiones de entrenamiento y test
+data.keys <- 1:nrow(data.dt)
+train_size = round(0.8 * nrow(data.dt))
+smplr <- srsSampler(key = data.keys, ssize = train_size)
+train.keys <- getSample(smplr)
+test.keys <- setdiff(data.keys, train.keys)
+
+head(data.dt)
+```
+
+Instanciamos los modelers internos:
+
+```{r}
+target <- "regression_target"
+#Los regresores podrían ser distintos, pero trabajaremos con los mismos en ambos modelers
+regressors <- setdiff(names(data.dt), target)
+
+#Definimos el modelo de clasificación
+params_cls <- list(
+  "num.trees" = 50,
+  "max.depth" = 20
+)
+
+cls_modeler <- rangerClassifierModeler(params = params_cls,
+                                       target = target,
+                                       regressors = regressors)
+
+target <- "regression_target"
+#Los regresores podrían ser distintos, pero trabajaremos con los mismos en ambos modelers
+regressors <- setdiff(names(data.dt), target)
+
+#Definimos el modelo de regresión
+params_reg <- list(
+  "num.trees" = 50,
+  "max.depth" = 20
+)
+
+reg_modeler <- rangerRegressorModeler(params = params_reg,
+                                      target = target,
+                                      regressors = regressors)
+```
+
+Ahora creamos el modelo en dos pasos:
+
+```{r}
+modeler <- classifRegRegressorModeler(classifModeler = cls_modeler,
+                                      regModeler = reg_modeler,
+                                      specialCats = 0)
+```
+
+Podríamos aplicar validación cruzada para tunear algunos de los hiperparámetros de este modeler, pero estos no son tan importantes como los hiperparámetros individuales de sus modelers internos.
+
+Por lo general, los modelers que se le pasen a este ya deberían tener unos hiperparámetros óptimos. Este paso, como ya lo hemos visto, vamos a omitirlo, y entrenamos directamente:
+
+```{r}
+modeler <- train(object = modeler,
+                 data = data.dt,
+                 subSet = train.keys)
+```
+
+Evaluamos para comprobar el rendimiento final del modeler:
+
+```{r}
+#Definimos una función de coste
+cf <- r2CostFunction()
+#Evaluación sobre el conjunto de train
+evaluate(object = modeler,
+         data = data.dt,
+         cost_function = cf,
+         subSet = train.keys)
+#Evaluación sobre el conjunto de test
+evaluate(object = modeler,
+         data = data.dt,
+         cost_function = cf,
+         subSet = test.keys)
+```
+
+Si queremos ver el rendimiento de los modeler internos, podemos utilizar el método evaluate de forma distinta:
+
+```{r}
+#Evaluación de ambos modelers por separado
+cf2 <- list("classifModeler" = confusionMatrixCostFunction(),
+            "regModeler" = r2CostFunction())
+
+
+#Evaluación sobre el conjunto de train de ambos modelers
+evaluate(object = modeler,
+         data = data.dt,
+         cost_function = cf2,
+         subSet = train.keys)
+#Evaluación sobre el conjunto de test de ambos modelers
+evaluate(object = modeler,
+         data = data.dt,
+         cost_function = cf2,
+         subSet = test.keys)
+```
+
+El guardado y la carga del modeler es equivalente al resto. Puesto que es una operación homogénea en todos los modelers, ya no la veremos más.
+
+```{r}
+#Definimos una ruta de guardado y un nombre para el archivo
+m_path <- "./trained_modelers"
+m_filename <- "classif_reg.mlu"
+modelSave(object = modeler,
+          path = m_path,
+          fileName = m_filename)
+
+#Cargamos de nuevo el modelo y comprobamos que funciona
+loaded_modeler <- modelLoad(path = m_path, fileName = m_filename)
+```
+
+## benchRegressorModeler
+
+Modeler multivariante en el que se debe cumplir una o múltiples restricciones lineales (a especificar por el usuario) entre los outputs de sus modelers internos.
+
+Generamos un conjunto de datos con tres variables objetivo que tengan una relación lineal entre ellas.
+En particular: regression_target = A + B
+
+```{r}
+#Generamos un conjunto de datos apropiado para benchModeler
+original_data.dt <- generateRegressionData(n_samples = 1000, generate_random_weights = FALSE)
+
+#Definimos nuevas variables en los datos que tengan una restricción específica
+data.dt <- data.table::copy(original_data.dt)
+data.dt[, A := round(runif(dim(data.dt)[1], min = 0, max = 5))]
+data.dt[, B := regression_target - A]
+
+#Definimos las particiones de train y de test
+set.seed(273)
+data.keys <- 1:nrow(data.dt)
+train_size = round(0.8 * nrow(data.dt))
+smplr <- srsSampler(key = data.keys, ssize = train_size)
+train.keys <- getSample(smplr)
+test.keys <- setdiff(data.keys, train.keys)
+```
+
+### Instalación de osqp, gsubfn y Matrix
+
+Primero, debemos comprobar si las librerías `osqp`, `gsubfn` y `Matrix` están instaladas:
+
+```{r}
+require("osqp")
+require("gsubfn")
+require("Matrix")
+```
+
+Si no lo estuvieran, podemos instalarlas fácilmente desde el CRAN,
+mediante el comando `install.packages(...)`.
+
+La versión de la librería `osqp` debe ser como mínimo la `1.0.0`.
+
+### Uso de benchRegressorModeler
+
+Podemos ver los parámetros que necesita para instanciarse buscando `benchRegressorModeler` en la ayuda.
+
+Definimos primero a los submodelers, asumiendo que ya hemos obtenido los hiperparámetros óptimos para cada caso:
+
+```{r}
+#Definimos los parámetros de los submodelers
+#Destacamos que ninguno de los modelers ve la variable objetivo de otro. Solo ven la suya
+params_b1 <- list(
+  "num.trees" = 20,
+  "max.depth" = 20
+)
+target_b1 <- "regression_target"
+regressors_b1 <- setdiff(colnames(original_data.dt), target_b1)
+
+params_b2 <- list(
+  "num.trees" = 30,
+  "max.depth" = 10
+)
+target_b2 <- "A"
+regressors_b2 <- setdiff(colnames(original_data.dt), c(target_b2, target_b1))
+
+params_b3 <- list(
+  "num.trees" = 40,
+  "max.depth" = 15
+)
+target_b3 <- "B"
+regressors_b3 <- setdiff(colnames(original_data.dt), c(target_b3, target_b1))
+
+modeler1 <- rangerRegressorModeler(params = params_b1, target = target_b1, regressors = regressors_b1)
+
+modeler2 <- rangerRegressorModeler(params = params_b2, target = target_b2, regressors = regressors_b2)
+
+modeler3 <- rangerRegressorModeler(params = params_b3, target = target_b3, regressors = regressors_b3)
+```
+
+Definimos el benchModeler:
+
+```{r}
+b_modeler <- benchRegressorModeler(submodels = list(modeler1,modeler2,modeler3),
+                                   benchmarks = "A+B-regression_target==0")
+#benchmarks puede ser un solo string o un vector de strings
+```
+
+Entrenamos:
+
+```{r}
+b_modeler <- train(b_modeler,
+                   data = data.dt,
+                   subSet = train.keys)
+```
+
+Predicciones:
+
+```{r}
+preds <- getPredictions(object = b_modeler,
+                        data = data.dt,
+                        subSet = test.keys)
+head(preds)#Podemos ver que la restricción lineal se respeta
+```
+
+Evaluación:
+
+```{r}
+#Definimos una función de coste
+cf <- r2CostFunction()
+#Evaluación sobre el conjunto de train
+evaluate(object = b_modeler,
+         data = data.dt,
+         cost_function = cf,
+         subSet = train.keys)
+#Evaluación sobre el conjunto de test
+evaluate(object = b_modeler,
+         data = data.dt,
+         cost_function = cf,
+         subSet = test.keys)
+```
+
+## preproRegressorModeler
+
+Los PreproModelers son uno de los tipos de modelers complejos de RMLutils, que funcionan tanto para tareas de clasificación como de regresión.
+
+La principal característica de los PreproModeler es que aplican una función de preprocesado justo antes de entrenar o predecir con un modeler cualquiera.
+Esta función de preprocesado puede ser definida totalmente por el usuario para que se adapte a sus necesidades.
+Con tal de integrar dicha función con la interfaz de los modelers de RMLutils, el usuario debe hacer uso del preproObject. 
+
+En el siguiente segmento de código se define uno con una función de preprocesado ya implementada en RMLutils,
+que también tiene documentación (basta con buscar `minMaxScalerPreproFunction`):
+
+```{r}
+#Definición de parámetros de preprocesado
+prepro_params <- list(modeler_type = NULL, pretrained_min_max = NULL)
+
+#Definición de preproObject
+prepro_object <- preproObject(preproFunction = minMaxScalerPreproFunction,
+                              params = prepro_params)
+```
+
+La función de preprocesado debe cumplir ciertas características, aunque no las discutiremos en este tutorial.
+Puede verse un tutorial más completo en la carpeta de tutoriales de github.
+
+Generamos datos:
+
+### Uso del preproClassifierModeler
+
+```{r}
+#Generamos un conjunto de datos
+c_data.dt <- generateMulticlassClassificationData(n_samples = 1000,
+                                                  generate_random_weights = FALSE)
+
+#Definimos las particiones de train y test
+set.seed(273)
+c_data.keys <- 1:nrow(c_data.dt)
+c_train_size = round(0.8 * nrow(c_data.dt))
+c_smplr <- srsSampler(key = c_data.keys, ssize = c_train_size)
+c_train.keys <- getSample(c_smplr)
+c_test.keys <- setdiff(c_data.keys, c_train.keys)
+```
+
+Definimos primero el modeler interno y el preproObject:
+
+```{r}
+c_target <- "classification_target"
+c_regressors <- setdiff(colnames(c_data.dt), c_target)
+c_params <- list(
+  "num.trees" = 10,
+  "max.depth" = 5
+)
+
+#Modelo interno de clasificación
+c_modeler <- rangerClassifierModeler(params = c_params,
+                                     target = c_target,
+                                     regressors = c_regressors)
+
+#Parámetros de preprocesado
+c_prepro_params <- list(modeler_type = NULL, pretrained_min_max = NULL)
+
+#Definimos el preproObject
+c_prepro_object <- preproObject(preproFunction = minMaxScalerPreproFunction,
+                                params = c_prepro_params)
+```
+
+Finalmente, definimos el preproModeler y entrenamos:
+
+```{r}
+pc_modeler <- preproClassifierModeler(modeler = c_modeler,
+                                      preproObject = c_prepro_object)
+pc_modeler <- train(pc_modeler,
+                    data = c_data.dt,
+                    subSet = c_train.keys)
+```
+
+Evaluamos:
+
+```{r}
+#Definimos una función de coste
+cf <- accuracyCostFunction()
+#Evaluación sobre el conjunto de train
+evaluate(object = pc_modeler,
+         data = c_data.dt,
+         cost_function = cf,
+         subSet = c_train.keys)
+#Evaluación sobre el conjunto de test
+evaluate(object = pc_modeler,
+         data = c_data.dt,
+         cost_function = cf,
+         subSet = c_test.keys)
+```
+

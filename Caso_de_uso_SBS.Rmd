@@ -1,0 +1,350 @@
+---
+title: "Caso de uso de RMLutils"
+author: "Jordi Verdú Naranjo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    number_sections: true
+    theme: united
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(RMLutils)
+library(data.table)
+dir.create(file.path("./trained_modelers"), showWarnings = FALSE)
+```
+
+En este tutorial vamos a tratar de resolver un problema realista de inferencia poblacional, en el que trataremos de obtener la cifra de negocios total de una población de empresas (a partir de datos sintéticos).
+
+## Generación de datos para el problema
+
+Asumimos un marco poblacional de 20000 empresas, del cual pretendemos extraer una muestra estratificada de 5000.
+
+```{r}
+N <- 20000
+n <- 5000
+data.dt <- generateSBSData(N)
+head(data.dt)
+```
+
+## Diseño muestral
+
+Hacemos una comprobación inicial para ver cuál es la varianza en cada estrato.
+
+```{r}
+print(data.dt[, .(var = var(revenue), sdev = sd(revenue), N_stratum = .N), by = c("business_strata")])
+```
+
+Podemos ver que el estrato *very_large* tiene una varianza desproporcionada comparada con las otras dos.
+
+Por simplificar los cálculos, vamos a asumir que esta información la hemos obtenido de una encuesta piloto, que nos proporciona una estimación aproximada de la varianza de cada estrato. Con esto, podemos aplicar muestreo estratificado con asignación de Neyman (o mínima varianza).
+
+Ya que el estrato de las grandes empresas tiene tanta varianza, será exhaustivo (lo cual ocurre también en nuestro caso de uso real).
+
+```{r}
+#Calculamos la proporción de la muestra para cada estrato
+info_strata.dt <- data.dt[business_strata != "very_large", .(sdev = sd(revenue), N_stratum = .N), by = c("business_strata")]
+info_strata.dt[, NxS := N_stratum * sdev]
+info_strata.dt[, neyman_factor := NxS/sum(NxS)]
+print(info_strata.dt)
+```
+
+```{r}
+#Sacamos los factores de Neyman y algunas variables más
+small_factor <- round(info_strata.dt[business_strata == "small", neyman_factor], 2)
+middle_large_factor <- round(info_strata.dt[business_strata == "middle_large", neyman_factor], 2)
+
+#Esto es por si se cambia N o n al principio del documento
+exhaustive_strata_n <- data.dt[business_strata == "very_large", .N]
+n_other <- n - exhaustive_strata_n
+```
+
+
+```{r}
+#Calculamos el total real para tenerlo de referencia
+true_total <- data.dt[, sum(revenue)]
+
+set.seed(273)
+
+#Definimos el mainSampler (el diseño  de la encuesta)
+main_sampler <- ssSampler(key = 1:N,
+                          ssize = c("small" = round(small_factor * n_other),
+                                    "middle_large" = round(middle_large_factor * n_other),
+                                    "very_large" = exhaustive_strata_n),
+                          strata = data.dt[, business_strata])
+main_sample <- getSample(main_sampler)#Muestra real
+
+#Quitamos el resto de valores que no estén en la muestra
+data.dt[!main_sample, cifra_negocios := NA]
+```
+
+```{r}
+#Definimos un subSampler que tomará el 70% de las muestras de los estratos small
+#y middle_large
+ss_factor <- 0.7
+sub_sampler <- ssSampler(key = main_sample,
+                         ssize = c("small" = round(ss_factor * small_factor * n_other),
+                                   "middle_large" = round(ss_factor * middle_large_factor * n_other),
+                                   "very_large" = exhaustive_strata_n),
+                         strata = data.dt[main_sample, business_strata])
+```
+
+
+```{r}
+#Definimos un modeler encargado de predecir la cifra de negocios (revenue)
+target <- "revenue"
+regressors <- setdiff(names(data.dt), target)
+params <- list(
+  "mtry" = 3,
+  "num.trees" = 40,
+  "max.depth" = 20
+)
+modeler <- rangerRegressorModeler(params, target, regressors)
+```
+
+
+## Estimación del total poblacional con el estimador MCSubRBEstimate (insesgado)
+
+```{r}
+set.seed(273)
+#Llamamos al estimador Monte Carlo. Especificamos 100 submuestreos
+estim <- MCSubRBEstimate(auxModeler = modeler,
+                         data = data.dt,
+                         mainSampler = main_sampler,
+                         subSampler = sub_sampler,
+                         targetVar = target,
+                         ssNumber = 100)
+  
+  
+
+print("Valor real:")
+print(paste0("Total real: ", true_total))
+
+print("Valores estimados:")
+print(paste0("Total estimado: ", estim$total$value))
+print(paste0("Error Monte Carlo del total: ", estim$total$MC_error))
+print(paste0("Varianza del estimador: ", estim$variance$value))
+print(paste0("Error Monte Carlo de la varianza: ", estim$variance$MC_error))
+```
+
+## Estimación del total poblacional con MCSubRBMSEEstimator (sesgado)
+
+Recordamos que el sesgo se escribe como $\mathbb{B} = \hat{\theta} - \theta$, con lo que tenemos que restarle el sesgo al estimador obtenido para obtener la aproximación de $\theta$.
+
+```{r}
+#El submuestreo también es exhaustivo para el estrato very_large
+set.seed(273)
+
+#Llamamos a la función de estimación 
+estim <- MCSubRBMSEEstimate(auxModeler = modeler,
+                            data = data.dt,
+                            mainSampler = main_sampler,
+                            mainSample = main_sample,
+                            subSampler = sub_sampler,
+                            targetVar = target,
+                            ssNumber = 100)
+
+
+print(paste0("True total: ", true_total))
+print("-----------------------")
+print("Estimate values:")
+print("-----------------------")
+print(paste0("Total estimate (with bias): ", estim$revenue$estimate))
+print(paste0("Bias estimate: ", estim$revenue$bias))
+print(paste0("Total estimate (with bias correction): ", estim$revenue$estimate - estim$revenue$bias))
+print(paste0("MSE of total estimate: ", estim$revenue$mse))
+print(paste0("Monte Carlo error of total estimate: ", estim$revenue$mcerror))
+```
+
+## Cómo utilizar MCSubRBMSEEstimator en la práctica
+
+En general, el valor (o aproximación) del total poblacional no va a estar disponible en un problema genérico. Por ello, lo habitual es emplear esta función de coste junto a otros estimadores en una segunda fase de selección de modelos.
+
+Para efectuar una estimación asistida por modelos apropiada, lo recomendable es:
+
+1) Efectuar tuneado de hiperparámetros sobre múltiples modelos y seleccionar los de mayor rendimiento.
+
+2) Para los de mayor rendimiento, aplicar el estimador y comparar la estimación y su sesgo con otro estimador insesgado. Por lo general, los modelos que proporcionen una estimación con menor sesgo, serán preferibles.
+
+3) La estimación del sesgo debe compararse con el valor del estimador insesgado, puesto que según las características del submuestreo y del modelo, es posible que la estimación del sesgo no sea lo suficientemente buena. Para este caso, suele ser necesario aplicar corrección de sesgo en las predicciones (que no desarrollaremos en este tutorial por ser un caso ya de alta complejidad).
+
+Vamos a aplicar un caso sencillo con un modelo de ranger y otro de lightgbm:
+
+```{r}
+#install.packages("lightgbm")
+#Comprobamos que está instalada
+#library(lightgbm)
+```
+
+
+```{r}
+#Aplicamos validación cruzada
+huperParamsSetLightGBM <- list(
+  "learning_rate" = c(0.01, 0.01, 0.1),
+  "nrounds" = c(50, 100),
+  "objective" = "regression",
+  "verbose" = -1
+)
+hyperParamsLightGBM <- expandHyperParams(huperParamsSetLightGBM)
+
+hyperParamsSetRanger <- list(
+  "mtry" = c(3,4),
+  "num.trees" = c(50, 60),
+  "max.depth" = c(30, 35, 40),
+  "importance" = "impurity"
+)
+hyperParamsRanger <- expandHyperParams(hyperParamsSetRanger)
+
+#Separamos en train y test
+set.seed(273)
+train.keys <- getSample(sub_sampler)
+
+#Definimos una función de coste
+cf <- MSECostFunction()
+#Definimos sampler de validación cruzada
+CVSampler <- cvSampler(key = train.keys, folds = 5)
+opt_cost_ranger <- Inf
+opt_cost_lightgbm <- Inf
+```
+
+```{r}
+n1 <- length(hyperParamsLightGBM)
+for(i in 1:n1){
+  lightgbm_reg_modeler <- LGBRegressorModeler(params = hyperParamsLightGBM[[i]],
+                                              target = target,
+                                              regressors = regressors)
+  
+  cost_lightgbm <- crossValidate(modeler = lightgbm_reg_modeler,
+                                 data = data.dt,
+                                 CVSampler = CVSampler,
+                                 costFunction = cf)
+  
+  print(paste0("(LightGBM)Coste del conjunto ", i, ": ", cost_lightgbm[[1]]))
+  
+  if(cost_lightgbm[[1]] < opt_cost_lightgbm){
+    opt_cost_lightgbm <- cost_lightgbm[[1]]
+    opt_hyperparams_lightgbm <- hyperParamsLightGBM[[i]]
+  }
+}
+print(paste0("Coste óptimo para lightgbm: ", opt_cost_lightgbm))
+
+```
+
+```{r}
+n2 <- length(hyperParamsRanger)
+for(i in 1:n2){
+  ranger_reg_modeler <- rangerRegressorModeler(params = hyperParamsRanger[[i]],
+                                               target = target,
+                                               regressors = regressors)
+  
+  cost_ranger <- crossValidate(modeler = ranger_reg_modeler,
+                               data = data.dt,
+                               CVSampler = CVSampler,
+                               costFunction = cf)
+
+  print(paste0("(Ranger)Coste del conjunto ", i, ": ", cost_ranger[[1]]))
+  
+  if(cost_ranger[[1]] < opt_cost_ranger){
+    opt_cost_ranger <- cost_ranger[[1]]
+    opt_hyperparams_ranger <- hyperParamsRanger[[i]]
+  }
+}
+
+print(paste0("Coste óptimo para ranger: ", opt_cost_ranger))
+```
+
+Vamos a quedarnos con los hiperparámetros óptimos para cada uno
+
+```{r}
+lightgbm_modeler <- LGBRegressorModeler(params = opt_hyperparams_lightgbm,
+                                        target = target,
+                                        regressors = regressors)
+ranger_modeler <- rangerRegressorModeler(params = opt_hyperparams_ranger,
+                                         target = target,
+                                         regressors = regressors)
+```
+
+Aplicamos un estimador insesgado, como HTEstimate:
+
+```{r}
+estim_ht <- HTEstimate(main_sampler, sampleKeys = main_sample, sampleData = data.dt[main_sample, revenue])
+estim_ht
+```
+
+```{r}
+#Modelo lightgbm
+set.seed(273)
+#Llamamos a la función de estimación 
+estim_l <- MCSubRBMSEEstimate(auxModeler = lightgbm_modeler,
+                            data = data.dt,
+                            mainSampler = main_sampler,
+                            mainSample = main_sample,
+                            subSampler = sub_sampler,
+                            targetVar = target,
+                            ssNumber = 100)
+
+
+print(paste0("True total: ", true_total))
+print("-----------------------")
+print("Estimate values:")
+print("-----------------------")
+print(paste0("Total estimate (with bias): ", estim_l$revenue$estimate))
+print(paste0("Bias estimate: ", estim_l$revenue$bias))
+print(paste0("Total estimate (with bias correction): ", estim_l$revenue$estimate - estim_l$revenue$bias))
+print(paste0("MSE of total estimate: ", estim_l$revenue$mse))
+print(paste0("Monte Carlo error of total estimate: ", estim_l$revenue$mcerror))
+```
+
+
+
+```{r}
+#Modelo ranger
+set.seed(273)
+#Llamamos a la función de estimación 
+estim_r <- MCSubRBMSEEstimate(auxModeler = ranger_modeler,
+                            data = data.dt,
+                            mainSampler = main_sampler,
+                            mainSample = main_sample,
+                            subSampler = sub_sampler,
+                            targetVar = target,
+                            ssNumber = 100)
+
+
+print(paste0("True total: ", true_total))
+print("-----------------------")
+print("Estimate values:")
+print("-----------------------")
+print(paste0("Total estimate (with bias): ", estim_r$revenue$estimate))
+print(paste0("Bias estimate: ", estim_r$revenue$bias))
+print(paste0("Total estimate (with bias correction): ", estim_r$revenue$estimate - estim_r$revenue$bias))
+print(paste0("MSE of total estimate: ", estim_r$revenue$mse))
+print(paste0("Monte Carlo error of total estimate: ", estim_r$revenue$mcerror))
+```
+
+```{r}
+#Creamos un data.table con todos los datos para compararlos más fácilmente
+model_info.dt <- data.table(
+  model=c("LightGBM", "Ranger"),
+  ht_estimate=c(estim_ht$total, estim_ht$total),
+  estimate=c(estim_l$revenue$estimate, estim_r$revenue$estimate),
+  debiased_estim = c(estim_l$revenue$estimate - estim_l$revenue$bias, estim_r$revenue$estimate - estim_r$revenue$bias),
+  mse=c(estim_l$revenue$mse, estim_r$revenue$mse),
+  est_bias=c(estim_l$revenue$bias, estim_r$revenue$bias)
+           )
+
+model_info.dt[, observed_bias := estimate - ht_estimate]
+model_info.dt[, b2_mse := (est_bias^2)/mse]
+print(model_info.dt)
+```
+
+Podemos ver que ambos modelos se comportan de forma muy diferente (recordamos que en general esto se haría con muchos más modelos). Pero parecen capturar razonablemente bien el comportamiento de la variable objetivo.
+
+El sesgo es muy significativo en LightGBM, siendo el prácticamente el 100% de la magnitud del MSE. Sin embargo, su estimación parece ser bastante buena, comparado con el sesgo observado.
+
+Respecto a Ranger, el sesgo sigue siendo importante en el MSE, y aunque es de menor magnitud, parece que su estimación no funciona demasiado bien. De hecho, parece tener el signo opuesto, haciendo que el estimador corregido de sesgo se aleje del valor real (y del predicho por el HT).
+
+Si el sesgo es una proporción grande del MSE, otra opción es utilizar el estimador insesgado en lugar de este (MCSubRBEstimator).
+En caso de probar ambos, también puede ser de interés comprobar la magnitud del MSE con la varianza del estimador insesgado.
